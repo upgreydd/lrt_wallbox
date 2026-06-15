@@ -1,6 +1,6 @@
 [project]
 name = "lrt_wallbox"
-version = "0.1.7"
+version = "0.1.8"
 description = "A Python client for interacting with LRT Wallbox devices via HTTP API."
 keywords = ["wallbox", "ev", "ocpp", "api", "lrt", "aeg"]
 readme = { file = "README.md", content-type = "text/markdown" }
@@ -14,10 +14,14 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
 ]
+# NOTE: keep these as lower-bound (>=) ranges, not exact (==) pins. Home Assistant
+# bundles and constrains cryptography/requests to its own versions, so an exact pin
+# (e.g. cryptography==45.0.3) makes the uv resolver fail when HA ships a newer one
+# (HA 2026.6 ships cryptography 48.0.0). The APIs used here are stable across these.
 dependencies = [
-    "cbor2==5.6.5",
-    "requests==2.32.4",
-    "cryptography==45.0.3",
+    "cbor2>=5.6.5",
+    "requests>=2.32.0",
+    "cryptography>=45.0.3",
     #    "bleak==1.0.1"
 ]
 
