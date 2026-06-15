@@ -1,6 +1,6 @@
 [project]
 name = "lrt_wallbox"
-version = "0.1.8"
+version = "0.2.0"
 description = "A Python client for interacting with LRT Wallbox devices via HTTP API."
 keywords = ["wallbox", "ev", "ocpp", "api", "lrt", "aeg"]
 readme = { file = "README.md", content-type = "text/markdown" }
@@ -13,6 +13,7 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
+    "Typing :: Typed",
 ]
 # NOTE: keep these as lower-bound (>=) ranges, not exact (==) pins. Home Assistant
 # bundles and constrains cryptography/requests to its own versions, so an exact pin
@@ -25,6 +26,11 @@ dependencies = [
     #    "bleak==1.0.1"
 ]
 
+[project.optional-dependencies]
+test = [
+    "pytest>=7.0",
+]
+
 [project.urls]
 Homepage = "https://github.com/Upgreydd/lrt_wallbox"
 Repository = "https://github.com/Upgreydd/lrt_wallbox"
@@ -35,3 +41,9 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 packages = ["lrt_wallbox", "lrt_wallbox.msg_types"]
+
+# Ship the PEP 561 marker so downstreams (e.g. the Home Assistant integration,
+# mypy) get type information. No other data files are packaged — in particular
+# *.pem keys generated at runtime must never end up in the wheel.
+[tool.setuptools.package-data]
+lrt_wallbox = ["py.typed"]

@@ -3,6 +3,8 @@ LRTClientPy.iml
 venv
 private_key.pem
 public_key.bin
+# Runtime-generated device keypair — must never be committed or packaged.
+*.pem
 main.py
 keys.py
 
