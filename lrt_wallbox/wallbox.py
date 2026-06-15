@@ -1,5 +1,6 @@
 import logging
 import os
+import secrets
 import threading
 import time
 from dataclasses import is_dataclass, asdict
@@ -11,12 +12,33 @@ from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.ec import EllipticCurvePrivateKey
 
-from .exceptions import WallboxError
+from .exceptions import (
+    WallboxError,
+    WallboxConnectionError,
+    WallboxTimeoutError,
+    WallboxAuthError,
+    error_for_kind,
+)
 from .msg_types import *
 
 logger = logging.getLogger(__name__)
 
 R = TypeVar("R")
+
+# Keys whose values must never reach the logs (credentials / key material).
+_SENSITIVE_KEYS = frozenset({"password", "encrypted", "publicKey", "signature", "challenge"})
+
+
+def _redact(value):
+    """Return a copy of *value* with sensitive fields masked, for safe logging."""
+    if isinstance(value, dict):
+        return {
+            k: ("***" if k in _SENSITIVE_KEYS else _redact(v))
+            for k, v in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return type(value)(_redact(v) for v in value)
+    return value
 
 
 class WallboxClient:
@@ -25,23 +47,39 @@ class WallboxClient:
         ip: str,
         username: str,
         password: str,
-        session_id: str = "1234567890",
+        session_id: Optional[str] = None,
         session_valid: float = 15.0,
+        key_path: Optional[str] = None,
     ):
+        """Create a client for an LRT/AEG wallbox.
+
+        Args:
+            ip: Device IP/host; reached over plaintext HTTP on the LAN.
+            username / password: Device credentials for password auth.
+            session_id: ``SESSIONID`` header value. Defaults to a random
+                per-instance 10-digit string (override only if the device
+                requires a specific value).
+            session_valid: Seconds an auth is cached before re-authenticating.
+            key_path: Directory in which to store the ECDSA keypair
+                (``privkey.pem`` / ``pubkey.pem``). Defaults to the package
+                directory for backwards compatibility, but callers running on
+                read-only / shared installs (e.g. Home Assistant) should pass a
+                writable, private location such as ``hass.config.path(...)``.
+        """
         self.ip = ip
-        self.session_id = session_id
+        self.session_id = session_id or "".join(secrets.choice("0123456789") for _ in range(10))
         self.__username = username
         self.__password = password
         self._session_valid = session_valid
+        self._key_dir = key_path or os.path.dirname(__file__)
         self._last_key_auth = 0.0
         self._last_password_auth = 0.0
         self._key_auth_lock = threading.Lock()
         self._password_auth_lock = threading.Lock()
 
-    @staticmethod
-    def _load_keys() -> tuple[EllipticCurvePrivateKey, bytes]:
-        priv_path = os.path.join(os.path.dirname(__file__), "privkey.pem")
-        pub_path = os.path.join(os.path.dirname(__file__), "pubkey.pem")
+    def _load_keys(self) -> tuple[EllipticCurvePrivateKey, bytes]:
+        priv_path = os.path.join(self._key_dir, "privkey.pem")
+        pub_path = os.path.join(self._key_dir, "pubkey.pem")
 
         if os.path.exists(priv_path) and os.path.exists(pub_path):
             with open(priv_path, "rb") as f:
@@ -57,16 +95,27 @@ class WallboxClient:
             format=serialization.PublicFormat.CompressedPoint,
         )
 
-        with open(priv_path, "wb") as f:
-            f.write(
-                private_key.private_bytes(
-                    encoding=serialization.Encoding.PEM,
-                    format=serialization.PrivateFormat.PKCS8,
-                    encryption_algorithm=serialization.NoEncryption(),
-                )
-            )
-        with open(pub_path, "wb") as f:
-            f.write(compressed_pub)
+        priv_bytes = private_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        try:
+            os.makedirs(self._key_dir, exist_ok=True)
+            # Private key is a device credential: create it 0600 (owner-only).
+            fd = os.open(priv_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "wb") as f:
+                f.write(priv_bytes)
+            with open(pub_path, "wb") as f:
+                f.write(compressed_pub)
+        except OSError as e:
+            raise WallboxError(
+                message=(
+                    f"Unable to persist wallbox keypair to {self._key_dir!r}: {e}. "
+                    "Pass key_path= to a writable directory."
+                ),
+                kind="KeyStorageError",
+            ) from e
 
         return private_key, compressed_pub
 
@@ -87,7 +136,7 @@ class WallboxClient:
             signature = app_private_key.sign(bytes(challenge_response.challenge), ec.ECDSA(hashes.SHA256()))
             r = self.auth_key_response(list(signature))
             if not r.authenticated:
-                raise WallboxError(message="Public key authentication failed", kind="AuthenticationError")
+                raise WallboxAuthError(message="Public key authentication failed", kind="AuthenticationError")
             self._last_key_auth = time.time()
 
     def _password_auth(self) -> None:
@@ -97,7 +146,7 @@ class WallboxClient:
                 return
             r = self.auth_password(self.__username, self.__password)
             if not r.authenticated:
-                raise WallboxError(message="Password authentication failed", kind="AuthenticationError")
+                raise WallboxAuthError(message="Password authentication failed", kind="AuthenticationError")
             self._last_password_auth = time.time()
 
     @staticmethod
@@ -147,28 +196,36 @@ class WallboxClient:
         payload = self._prepare_payload(payload)
         msg = f"sending payload key: {payload['key']}"
         if payload.get("body"):
-            msg += f", body: {payload['body']!r}"
+            msg += f", body: {_redact(payload['body'])!r}"
         logger.debug(msg)
 
         encoded = cbor2.dumps(payload)
-        resp = requests.post(
-            f"http://{self.ip}/api",
-            headers={
-                "Content-Type": "application/cbor",
-                "SESSIONID": self.session_id,
-            },
-            data=encoded,
-            timeout=10,
-        )
-        resp.raise_for_status()
+        try:
+            resp = requests.post(
+                f"http://{self.ip}/api",
+                headers={
+                    "Content-Type": "application/cbor",
+                    "SESSIONID": self.session_id,
+                },
+                data=encoded,
+                timeout=10,
+            )
+            resp.raise_for_status()
+        except requests.exceptions.Timeout as e:
+            raise WallboxTimeoutError(message=f"Request to {self.ip} timed out", kind="Timeout", key=key) from e
+        except requests.exceptions.ConnectionError as e:
+            raise WallboxConnectionError(message=f"Could not connect to {self.ip}: {e}", kind="ConnectionError", key=key) from e
+        except requests.exceptions.RequestException as e:
+            raise WallboxConnectionError(message=f"HTTP request to {self.ip} failed: {e}", kind="HTTPError", key=key) from e
+
         decoded = cbor2.loads(resp.content)
         if not resp.ok or not isinstance(decoded, dict):
-            raise WallboxError(message=f"Invalid response: {decoded}", kind="InvalidResponse")
+            raise WallboxError(message=f"Invalid response: {decoded}", kind="InvalidResponse", key=key)
         else:
-            logger.debug(f"received response: {decoded}")
+            logger.debug(f"received response: {_redact(decoded)}")
         if "error" in decoded:
             err = ErrorData(**decoded["error"])
-            raise WallboxError(message=err.message, field=err.field, kind=err.kind, key=key)
+            raise error_for_kind(err.kind)(message=err.message, field=err.field, kind=err.kind, key=key)
 
         body_data = decoded["body"]
         if response_model is not None:
@@ -182,7 +239,7 @@ class WallboxClient:
                 return body_data
             elif is_dataclass(response_model):
                 if not isinstance(body_data, dict):
-                    raise WallboxError(f"Invalid response: {body_data}")
+                    raise WallboxError(f"Invalid response: {body_data}", kind="InvalidResponse", key=key)
                 return response_model(**body_data)
             else:
                 return response_model(body_data)
